@@ -1,0 +1,133 @@
+name: build-tweak
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Write source
+        run: |
+          cat > VBoxPlayURL.m <<'EOF'
+          #import <UIKit/UIKit.h>
+          #import <objc/runtime.h>
+          #import <dispatch/dispatch.h>
+          #import <unistd.h>
+          #import <string.h>
+
+          static NSString *const kLogPath = @"/var/mobile/Documents/Workspace/playurl.log";
+
+          static void VLog(NSString *fmt, ...) {
+          va_list ap; va_start(ap, fmt);
+          NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+          va_end(ap);
+          NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], msg];
+          NSLog(@"[VBoxPlayURL] %@", msg);
+          NSFileManager *fm = [NSFileManager defaultManager];
+          if (![fm fileExistsAtPath:kLogPath]) [fm createFileAtPath:kLogPath contents:nil attributes:nil];
+          NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kLogPath];
+          if (fh) { [fh seekToEndOfFile]; [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
+          NSString *sb = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/playurl.log"];
+          if (![fm fileExistsAtPath:sb]) [fm createFileAtPath:sb contents:nil attributes:nil];
+          NSFileHandle *fh2 = [NSFileHandle fileHandleForWritingAtPath:sb];
+          if (fh2) { [fh2 seekToEndOfFile]; [fh2 writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [fh2 closeFile]; }
+          }
+
+          static void VLogURL(const char *tag, id url) {
+          NSString *s = nil;
+          if ([url isKindOfClass:[NSURL class]]) s = [(NSURL *)url absoluteString];
+          else if ([url isKindOfClass:[NSString class]]) s = (NSString *)url;
+          else if (url) s = [url description];
+          VLog(@"%s => %@", tag, s ?: @"(nil)");
+          if (s.length > 8) dispatch_async(dispatch_get_main_queue(), ^{ [UIPasteboard generalPasteboard].string = s; });
+          }
+
+          static IMP g_setUrl, g_setUrlChanged, g_urlChanged, g_open, g_load, g_prepare, g_od_setUrl;
+
+          static void h_setUrl(id self, SEL c, id u) { VLogURL("FSMediaPlayback.setUrl:", u); if (g_setUrl) ((void(*)(id,SEL,id))g_setUrl)(self,c,u); }
+          static void h_setUrlChanged(id self, SEL c, id u) { VLogURL("FSMediaPlayback.setUrlChanged:", u); if (g_setUrlChanged) ((void(*)(id,SEL,id))g_setUrlChanged)(self,c,u); }
+          static id h_urlChanged(id self, SEL c) { id r = g_urlChanged ? ((id(*)(id,SEL))g_urlChanged)(self,c) : nil; VLogURL("FSMediaPlayback.urlChanged", r); return r; }
+          static void h_open(id self, SEL c) { VLog(@"FSMediaPlayback.open"); if (g_open) ((void(*)(id,SEL))g_open)(self,c); }
+          static void h_load(id self, SEL c) { VLog(@"FSMediaPlayback.load"); if (g_load) ((void(*)(id,SEL))g_load)(self,c); }
+          static void h_prepare(id self, SEL c) { VLog(@"FSMediaPlayback.prepareToPlay"); if (g_prepare) ((void(*)(id,SEL))g_prepare)(self,c); }
+          static void h_od_setUrl(id self, SEL c, id u) { VLogURL("FSMediaUrlOpenData.setUrl:", u); if (g_od_setUrl) ((void(*)(id,SEL,id))g_od_setUrl)(self,c,u); }
+
+          static IMP Swap(Class cls, const char *name, IMP imp) {
+          if (!cls) return NULL;
+          SEL sel = sel_registerName(name);
+          Method m = class_getInstanceMethod(cls, sel);
+          if (!m) return NULL;
+          IMP orig = method_getImplementation(m);
+          class_replaceMethod(cls, sel, imp, method_getTypeEncoding(m));
+          return orig;
+          }
+
+          static void DumpClasses(void) {
+          unsigned int n = 0;
+          Class *cs = objc_copyClassList(&n);
+          for (unsigned int i = 0; i < n; i++) {
+          const char *cn = class_getName(cs[i]);
+          if (!cn || strncmp(cn, "FSMedia", 7) != 0) continue;
+          VLog(@"CLASS %s", cn);
+          unsigned int nm = 0;
+          Method *ms = class_copyMethodList(cs[i], &nm);
+          for (unsigned int j = 0; j < nm; j++) VLog(@"   -[%s %s] %s", cn, sel_getName(method_getName(ms[j])), method_getTypeEncoding(ms[j]) ?: "");
+          free(ms);
+          }
+          free(cs);
+          }
+
+          static int gTries = 0;
+
+          static void Retry(void);
+
+          static void TryHook(void) {
+          Class c = objc_getClass("FSMediaPlayback");
+          Class d = objc_getClass("FSMediaUrlOpenData");
+          g_setUrl = Swap(c, "setUrl:", (IMP)h_setUrl);
+          g_setUrlChanged = Swap(c, "setUrlChanged:", (IMP)h_setUrlChanged);
+          g_urlChanged = Swap(c, "urlChanged", (IMP)h_urlChanged);
+          g_open = Swap(c, "open", (IMP)h_open);
+          g_load = Swap(c, "load", (IMP)h_load);
+          g_prepare = Swap(c, "prepareToPlay", (IMP)h_prepare);
+          g_od_setUrl = Swap(d, "setUrl:", (IMP)h_od_setUrl);
+          VLog(@"HOOK setUrl=%d setUrlChanged=%d urlChanged=%d open=%d load=%d prepare=%d odSetUrl=%d",
+          g_setUrl != NULL, g_setUrlChanged != NULL, g_urlChanged != NULL,
+          g_open != NULL, g_load != NULL, g_prepare != NULL, g_od_setUrl != NULL);
+          DumpClasses();
+          }
+
+          static void Retry(void) {
+          if (objc_getClass("FSMediaPlayback")) { TryHook(); return; }
+          if (++gTries > 120) { VLog(@"FSMediaPlayback never loaded"); return; }
+          dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{ Retry(); });
+          }
+
+          __attribute__((constructor)) static void Init(void) {
+          VLog(@"=== VBoxPlayURL loaded pid=%d ===", getpid());
+          dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ Retry(); });
+          }
+          EOF
+          echo "---- source written ----"
+          wc -l VBoxPlayURL.m
+
+      - name: Compile dylib
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun clang -dynamiclib -arch arm64 -miphoneos-version-min=14.0 \
+            -isysroot "$SDK" -fobjc-arc \
+            -install_name @rpath/VBoxPlayURL.dylib \
+            -framework UIKit -framework Foundation \
+            -o VBoxPlayURL.dylib VBoxPlayURL.m
+          brew install ldid >/dev/null 2>&1 || true
+          ldid -S VBoxPlayURL.dylib
+          ls -lh VBoxPlayURL.dylib
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VBoxPlayURL-dylib
+          path: VBoxPlayURL.dylib
