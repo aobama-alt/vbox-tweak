@@ -17,9 +17,15 @@ jobs:
           #import <objc/runtime.h>
           #import <unistd.h>
           #import <string.h>
+          #import <ctype.h>
 
-          static NSMutableDictionary *gOrig;
-          static NSString *gLast;
+          static NSString *gLast = nil;
+          static int gRound = 0;
+          static BOOL gDumped = NO;
+
+          typedef struct { Class cls; SEL sel; IMP imp; int kind; } Rec;
+          static Rec gRecs[2048];
+          static int gRecCount = 0;
 
           static void VLog(NSString *fmt, ...) {
           va_list ap; va_start(ap, fmt);
@@ -27,50 +33,105 @@ jobs:
           va_end(ap);
           NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], msg];
           NSLog(@"[URLGrab] %@", msg);
-          NSString *p = [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
-                         stringByAppendingPathComponent:@"playurl.log"];
+          NSString *p = [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"] stringByAppendingPathComponent:@"playurl.log"];
           NSFileManager *fm = [NSFileManager defaultManager];
           if (![fm fileExistsAtPath:p]) [fm createFileAtPath:p contents:nil attributes:nil];
           NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
           if (fh) { [fh seekToEndOfFile]; [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
           }
 
-          static BOOL LooksLikeURL(NSString *s) {
-          if (s.length < 12) return NO;
-          if ([s hasPrefix:@"http://"] || [s hasPrefix:@"https://"]) return YES;
+          static BOOL ContainsCI(const char *hay, const char *needle) {
+          if (!hay || !needle) return NO;
+          size_t hl = strlen(hay), nl = strlen(needle);
+          if (nl == 0 || hl < nl) return NO;
+          for (size_t i = 0; i + nl <= hl; i++) {
+          size_t j = 0;
+          while (j < nl && tolower((unsigned char)hay[i+j]) == tolower((unsigned char)needle[j])) j++;
+          if (j == nl) return YES;
+          }
+          return NO;
+          }
+
+          static BOOL IsURLish(NSString *s) {
+          if (![s isKindOfClass:[NSString class]] || s.length < 10) return NO;
+          if ([s rangeOfString:@"://"].location != NSNotFound) return YES;
           if ([s rangeOfString:@".m3u8"].location != NSNotFound) return YES;
           if ([s rangeOfString:@".mp4"].location != NSNotFound) return YES;
           if ([s rangeOfString:@"token="].location != NSNotFound) return YES;
           return NO;
           }
 
-          static void GenericHook(id self, SEL _cmd, id arg) {
-          NSString *s = nil;
-          if ([arg isKindOfClass:[NSString class]]) s = (NSString *)arg;
-          else if ([arg isKindOfClass:[NSURL class]]) s = [(NSURL *)arg absoluteString];
-
-          if (s && LooksLikeURL(s) && ![s isEqualToString:gLast]) {
-          gLast = s;
-          VLog(@"[HIT] -[%s %s] => %@", class_getName([self class]), sel_getName(_cmd), s);
+          static void Report(const char *cls, const char *sel, NSString *s) {
+          if (!IsURLish(s)) return;
+          if (gLast && [s isEqualToString:gLast]) return;
+          gLast = [s copy];
+          VLog(@"[HIT] %s %s => %@", cls, sel, s);
           }
 
-          NSString *key = [NSString stringWithFormat:@"%s/%s", class_getName([self class]), sel_getName(_cmd)];
-          NSValue *v = gOrig[key];
-          if (v) ((void(*)(id,SEL,id))[v pointerValue])(self, _cmd, arg);
+          static IMP FindOrig(id self, SEL cmd) {
+          for (int i = gRecCount - 1; i >= 0; i--) {
+          if (gRecs[i].sel == cmd && [self isKindOfClass:gRecs[i].cls]) return gRecs[i].imp;
+          }
+          return NULL;
           }
 
-          static void DumpClasses(void) {
+          static void TryArg(const char *cls, const char *sel, void *p) {
+          if (!p) return;
+          @try {
+          id o = (__bridge id)p;
+          if ([o isKindOfClass:[NSString class]]) Report(cls, sel, (NSString *)o);
+          else if ([o isKindOfClass:[NSURL class]]) Report(cls, sel, [(NSURL *)o absoluteString]);
+          } @catch (NSException *e) {}
+          }
+
+          static id InitHook(id self, SEL cmd, void*a, void*b, void*c, void*d, void*e, void*f) {
+          const char *cls = class_getName([self class]);
+          const char *sel = sel_getName(cmd);
+          TryArg(cls, sel, a); TryArg(cls, sel, b); TryArg(cls, sel, c); TryArg(cls, sel, d);
+          IMP o = FindOrig(self, cmd);
+          if (!o) return nil;
+          return ((id(*)(id,SEL,void*,void*,void*,void*,void*,void*))o)(self,cmd,a,b,c,d,e,f);
+          }
+
+          static id GetHook(id self, SEL cmd) {
+          const char *cls = class_getName([self class]);
+          const char *sel = sel_getName(cmd);
+          IMP o = FindOrig(self, cmd);
+          if (!o) return nil;
+          id r = ((id(*)(id,SEL))o)(self, cmd);
+          @try {
+          if ([r isKindOfClass:[NSString class]]) Report(cls, sel, (NSString *)r);
+          else if ([r isKindOfClass:[NSURL class]]) Report(cls, sel, [(NSURL *)r absoluteString]);
+          } @catch (NSException *e) {}
+          return r;
+          }
+
+          static void SetHook(id self, SEL cmd, void*a, void*b, void*c, void*d, void*e, void*f) {
+          const char *cls = class_getName([self class]);
+          const char *sel = sel_getName(cmd);
+          TryArg(cls, sel, a);
+          IMP o = FindOrig(self, cmd);
+          if (o) ((void(*)(id,SEL,void*,void*,void*,void*,void*,void*))o)(self,cmd,a,b,c,d,e,f);
+          }
+
+          static void DumpOnce(void) {
+          if (gDumped) return;
+          gDumped = YES;
           unsigned int n = 0;
           Class *cs = objc_copyClassList(&n);
           for (unsigned int i = 0; i < n; i++) {
           const char *cn = class_getName(cs[i]);
-          if (!cn || strncmp(cn, "FSMedia", 7) != 0) continue;
-          VLog(@"CLASS %s", cn);
+          if (!cn) continue;
+          if (!(strstr(cn, "FSMedia") || strstr(cn, "FSPlayer") || strstr(cn, "FSMonitor"))) continue;
           unsigned int nm = 0;
           Method *ms = class_copyMethodList(cs[i], &nm);
-          for (unsigned int j = 0; j < nm; j++)
-          VLog(@"   -[%s %s] %s", cn, sel_getName(method_getName(ms[j])),
-          method_getTypeEncoding(ms[j]) ?: "");
+          int printed = 0;
+          for (unsigned int j = 0; j < nm && printed < 25; j++) {
+          const char *sn = sel_getName(method_getName(ms[j]));
+          if (!ContainsCI(sn, "url")) continue;
+          VLog(@"DUMP %s : %s", cn, sn);
+          printed++;
+          }
           free(ms);
           }
           free(cs);
@@ -83,33 +144,46 @@ jobs:
           for (unsigned int i = 0; i < n; i++) {
           Class c = cs[i];
           const char *cn = class_getName(c);
-          if (!cn || strncmp(cn, "FS", 2) != 0) continue;
+          if (!cn) continue;
+          if (!(strstr(cn, "FS") || ContainsCI(cn, "media") || ContainsCI(cn, "player") || ContainsCI(cn, "mpv"))) continue;
 
           unsigned int nm = 0;
           Method *ms = class_copyMethodList(c, &nm);
           for (unsigned int j = 0; j < nm; j++) {
           SEL sel = method_getName(ms[j]);
           const char *sn = sel_getName(sel);
-          if (strncmp(sn, "set", 3) != 0) continue;
-          if (!strcasestr(sn, "url")) continue;
-          if (method_getNumberOfArguments(ms[j]) != 3) continue;
+          if (!ContainsCI(sn, "url")) continue;
+          if (gRecCount >= 2048) break;
 
-          char *ret = method_copyReturnType(ms[j]);
-          BOOL isVoid = (ret && ret[0] == 'v');
-          free(ret);
-          if (!isVoid) continue;
+          BOOL dup = NO;
+          for (int k = 0; k < gRecCount; k++) {
+          if (gRecs[k].cls == c && gRecs[k].sel == sel) { dup = YES; break; }
+          }
+          if (dup) continue;
 
-          char *a2 = method_copyArgumentType(ms[j], 2);
-          BOOL isObj = (a2 && a2[0] == '@');
-          free(a2);
-          if (!isObj) continue;
+          unsigned int argc = method_getNumberOfArguments(ms[j]);
+          char *rtp = method_copyReturnType(ms[j]);
+          char rt = rtp ? rtp[0] : 'v';
+          free(rtp);
 
-          NSString *key = [NSString stringWithFormat:@"%s/%s", cn, sn];
-          if (gOrig[key]) continue;
+          int kind = -1;
+          if (strncmp(sn, "init", 4) == 0 && rt == '@') kind = 0;
+          else if (strncmp(sn, "set", 3) == 0 && rt == 'v' && argc == 3) kind = 2;
+          else if (rt == '@' && argc == 2) kind = 1;
+          if (kind < 0) continue;
 
-          gOrig[key] = [NSValue valueWithPointer:method_getImplementation(ms[j])];
-          method_setImplementation(ms[j], (IMP)GenericHook);
-          VLog(@"HOOKED -[%s %s]", cn, sn);
+          gRecs[gRecCount].cls = c;
+          gRecs[gRecCount].sel = sel;
+          gRecs[gRecCount].imp = method_getImplementation(ms[j]);
+          gRecs[gRecCount].kind = kind;
+
+          IMP ni = (IMP)InitHook;
+          if (kind == 1) ni = (IMP)GetHook;
+          else if (kind == 2) ni = (IMP)SetHook;
+          method_setImplementation(ms[j], ni);
+
+          VLog(@"HOOKED(%d) %s : %s argc=%u rt=%c", kind, cn, sn, argc, rt);
+          gRecCount++;
           hooked++;
           }
           free(ms);
@@ -118,26 +192,23 @@ jobs:
           return hooked;
           }
 
-          static int gRound = 0;
-
           static void Tick(void);
 
           static void Tick(void) {
           gRound++;
           int h = Scan();
-          if (gRound <= 6 || h > 0) VLog(@"scan#%d hooked=%d", gRound, h);
-          if (gRound == 3) DumpClasses();
-          if (gRound > 90) return;
+          if (gRound <= 5 || h > 0) VLog(@"scan#%d hooked=%d total=%d", gRound, h, gRecCount);
+          if (gRound == 2) DumpOnce();
+          if (gRound > 150) return;
           dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{ Tick(); });
           }
 
           __attribute__((constructor)) static void Init(void) {
-          gOrig = [NSMutableDictionary new];
-          VLog(@"=== URLGrab loaded pid=%d ===", getpid());
+          VLog(@"=== URLGrab v2 loaded pid=%d ===", getpid());
           dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ Tick(); });
           }
           SRCEOF
-          echo "---- source written ----"
+          echo "---- written ----"
           wc -l URLGrab.m
 
       - name: Compile dylib
@@ -154,5 +225,5 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: URLGrab-dylib
+          name: URLGrab2-dylib
           path: URLGrab.dylib
